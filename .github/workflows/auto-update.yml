@@ -91,8 +91,10 @@ jobs:
         if [ "${{ steps.promotion-check.outputs.promotion_run }}" = "true" ]; then
           echo "Skipping build - using existing next image for promotion"
         else
-          echo "Building image with next tag..."
-          docker build -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:next .
+          echo "Building image with next tag using specific digest..."
+          BASE_IMAGE_WITH_DIGEST="phpmyadmin@${{ steps.current-digest.outputs.current_digest }}"
+          echo "Using base image: $BASE_IMAGE_WITH_DIGEST"
+          docker build --build-arg BASE_IMAGE="$BASE_IMAGE_WITH_DIGEST" -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:next .
         fi
 
     - name: Test the next build
