@@ -5,6 +5,9 @@ on:
     # Run daily at 2:00 AM UTC
     - cron: '0 2 * * *'
   workflow_dispatch: # Allow manual triggering
+  push:
+    branches: [main]
+    paths: ['.last-phpmyadmin-digest']  # Trigger when digest is updated
 
 env:
   REGISTRY: docker.io
@@ -47,7 +50,26 @@ jobs:
           echo "No cached digest found"
         fi
 
+    - name: Check if this is a post-merge promotion run
+      id: promotion-check
+      run: |
+        if [ "${{ github.ref_name }}" = "main" ] && [ "${{ github.event_name }}" = "push" ]; then
+          echo "promotion_run=true" >> $GITHUB_OUTPUT
+          echo "This is a post-merge run on main - will promote next to latest"
+        else
+          echo "promotion_run=false" >> $GITHUB_OUTPUT
+          echo "This is a regular check run"
+        fi
+
+    - name: Skip update check if this is promotion run
+      if: steps.promotion-check.outputs.promotion_run == 'true'
+      run: |
+        echo "Skipping update check - this is a post-merge promotion run"
+        echo "update_needed=promotion" >> $GITHUB_OUTPUT
+      id: skip-update-check
+
     - name: Compare digests and decide if update needed
+      if: steps.promotion-check.outputs.promotion_run == 'false'
       id: update-check
       run: |
         CURRENT="${{ steps.current-digest.outputs.current_digest }}"
@@ -64,10 +86,14 @@ jobs:
         fi
 
     - name: Build Docker image with next tag
-      if: steps.update-check.outputs.update_needed == 'true'
+      if: (steps.update-check.outputs.update_needed == 'true') || (steps.skip-update-check.outputs.update_needed == 'promotion')
       run: |
-        echo "Building image with next tag..."
-        docker build -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:next .
+        if [ "${{ steps.promotion-check.outputs.promotion_run }}" = "true" ]; then
+          echo "Skipping build - using existing next image for promotion"
+        else
+          echo "Building image with next tag..."
+          docker build -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:next .
+        fi
 
     - name: Test the next build
       if: steps.update-check.outputs.update_needed == 'true'
@@ -117,11 +143,11 @@ jobs:
         docker rm phpmyadmin-next-test
 
     - name: Set up Docker Buildx
-      if: steps.update-check.outputs.update_needed == 'true'
+      if: (steps.update-check.outputs.update_needed == 'true') || (steps.skip-update-check.outputs.update_needed == 'promotion')
       uses: docker/setup-buildx-action@v3
 
     - name: Log into Docker registry
-      if: steps.update-check.outputs.update_needed == 'true'
+      if: (steps.update-check.outputs.update_needed == 'true') || (steps.skip-update-check.outputs.update_needed == 'promotion')
       run: echo "${{ secrets.dockerhub_token }}" | docker login -u splitice --password-stdin
 
     - name: Push next image to registry
@@ -130,7 +156,7 @@ jobs:
         echo "Pushing next image to registry..."
         docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:next
 
-    - name: Update digest cache and merge to main
+    - name: Update digest cache and create PR for main merge
       if: steps.update-check.outputs.update_needed == 'true'
       run: |
         # Save the new digest
@@ -138,25 +164,62 @@ jobs:
         
         # Configure git
         git config --local user.email "action@github.com"
-        git config --local user.name "GitHub Action"
+        git config --local user.name "GitHub Action Auto-Update"
         
         # Commit the digest update
         git add .last-phpmyadmin-digest
-        git commit -m "Auto-update: phpMyAdmin base image updated to ${{ steps.current-digest.outputs.current_digest }}"
+        git commit -m "Auto-update: phpMyAdmin base image updated to ${{ steps.current-digest.outputs.current_digest }}" || echo "No changes to commit"
         
-        # Push to current branch first
+        # Push to current branch
         git push origin ${{ github.ref_name }}
         
-        # If we're not on main branch, merge to main
-        if [ "${{ github.ref_name }}" != "main" ]; then
-          git checkout main
-          git pull origin main
-          git merge ${{ github.ref_name }} --no-ff -m "Auto-merge: Updated phpMyAdmin base image"
-          git push origin main
-        fi
+        echo "Updated digest cache and pushed changes"
 
-    - name: Promote next to latest tag
-      if: steps.update-check.outputs.update_needed == 'true'
+    - name: Create Pull Request for main branch
+      if: steps.update-check.outputs.update_needed == 'true' && github.ref_name != 'main'
+      id: create-pr
+      uses: peter-evans/create-pull-request@v5
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        base: main
+        head: ${{ github.ref_name }}
+        title: "Auto-update: phpMyAdmin base image updated"
+        body: |
+          ## Auto-Update: phpMyAdmin Base Image Updated
+          
+          🤖 This PR was automatically created by the auto-update workflow.
+          
+          ### Changes:
+          - Updated phpMyAdmin base image to digest: `${{ steps.current-digest.outputs.current_digest }}`
+          - Built and tested image with "next" tag
+          - All tests passed successfully ✅
+          
+          ### Testing Results:
+          - ✅ HTTP redirects correctly to HTTPS
+          - ✅ HTTPS serves phpMyAdmin content properly
+          - ✅ Image builds without errors
+          - ✅ Container starts and runs successfully
+          
+          **Ready for merge!** 🚀
+        
+        assignees: splitice
+        draft: false
+
+    - name: Enable auto-merge on PR
+      if: steps.update-check.outputs.update_needed == 'true' && github.ref_name != 'main' && steps.create-pr.outputs.pull-request-number
+      run: |
+        # Enable auto-merge using GitHub CLI
+        gh pr merge ${{ steps.create-pr.outputs.pull-request-number }} --auto --squash
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Auto-merge to main (if on main branch)
+      if: steps.update-check.outputs.update_needed == 'true' && github.ref_name == 'main'
+      run: |
+        echo "Already on main branch - changes committed directly"
+
+    - name: Promote next to latest tag (if on main branch)
+      if: (steps.skip-update-check.outputs.update_needed == 'promotion') || (steps.update-check.outputs.update_needed == 'true' && github.ref_name == 'main')
       run: |
         # Pull the next image and tag it as latest
         docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:next
@@ -166,15 +229,28 @@ jobs:
         echo "Successfully promoted next to latest tag"
 
     - name: Create release summary
-      if: steps.update-check.outputs.update_needed == 'true'
+      if: (steps.update-check.outputs.update_needed == 'true') || (steps.skip-update-check.outputs.update_needed == 'promotion')
       run: |
-        echo "## Auto-Update Summary" >> $GITHUB_STEP_SUMMARY
-        echo "✅ **phpMyAdmin base image updated successfully**" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "- **Previous digest:** \`${{ steps.cache-check.outputs.cached_digest }}\`" >> $GITHUB_STEP_SUMMARY
-        echo "- **New digest:** \`${{ steps.current-digest.outputs.current_digest }}\`" >> $GITHUB_STEP_SUMMARY
-        echo "- **Tags updated:** \`next\` → \`latest\`" >> $GITHUB_STEP_SUMMARY
-        echo "- **Tests:** All tests passed ✅" >> $GITHUB_STEP_SUMMARY
+        if [ "${{ steps.promotion-check.outputs.promotion_run }}" = "true" ]; then
+          echo "## Auto-Update Promotion" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **Successfully promoted next → latest**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Action:** Promoted \`next\` tag to \`latest\` tag" >> $GITHUB_STEP_SUMMARY
+          echo "- **Trigger:** Post-merge promotion after successful PR" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "## Auto-Update Summary" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **phpMyAdmin base image updated successfully**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Previous digest:** \`${{ steps.cache-check.outputs.cached_digest }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **New digest:** \`${{ steps.current-digest.outputs.current_digest }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image tagged:** \`next\` and pushed to registry" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tests:** All tests passed ✅" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.ref_name }}" != "main" ]; then
+            echo "- **PR Created:** Ready for auto-merge to main branch" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Branch:** Changes committed directly to main" >> $GITHUB_STEP_SUMMARY
+          fi
+        fi
 
     - name: No update needed
       if: steps.update-check.outputs.update_needed == 'false'
