@@ -1,0 +1,264 @@
+name: Auto-Update phpMyAdmin Base Image
+
+on:
+  schedule:
+    # Run daily at 2:00 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch: # Allow manual triggering
+  push:
+    branches: [main]
+    paths: ['.last-phpmyadmin-digest']  # Trigger when digest is updated
+
+env:
+  REGISTRY: docker.io
+  IMAGE_NAME: halleyassistau/docker-phpmyadmin
+
+jobs:
+  check-and-update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      pull-requests: write
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        fetch-depth: 0
+
+    - name: Get current phpMyAdmin image digest
+      id: current-digest
+      run: |
+        # Pull the latest image and get its digest
+        docker pull phpmyadmin:latest >/dev/null 2>&1
+        CURRENT_DIGEST=$(docker inspect phpmyadmin:latest | jq -r '.[0].RepoDigests[0]' | cut -d'@' -f2)
+        echo "current_digest=$CURRENT_DIGEST" >> $GITHUB_OUTPUT
+        echo "Current phpMyAdmin digest: $CURRENT_DIGEST"
+
+    - name: Check for cached digest
+      id: cache-check
+      run: |
+        # Check if we have a cached digest file
+        if [ -f .last-phpmyadmin-digest ]; then
+          CACHED_DIGEST=$(cat .last-phpmyadmin-digest)
+          echo "cached_digest=$CACHED_DIGEST" >> $GITHUB_OUTPUT
+          echo "Cached digest: $CACHED_DIGEST"
+        else
+          echo "cached_digest=" >> $GITHUB_OUTPUT
+          echo "No cached digest found"
+        fi
+
+    - name: Check if this is a post-merge promotion run
+      id: promotion-check
+      run: |
+        if [ "${{ github.ref_name }}" = "main" ] && [ "${{ github.event_name }}" = "push" ]; then
+          echo "promotion_run=true" >> $GITHUB_OUTPUT
+          echo "This is a post-merge run on main - will promote next to latest"
+        else
+          echo "promotion_run=false" >> $GITHUB_OUTPUT
+          echo "This is a regular check run"
+        fi
+
+    - name: Skip update check if this is promotion run
+      if: steps.promotion-check.outputs.promotion_run == 'true'
+      run: |
+        echo "Skipping update check - this is a post-merge promotion run"
+        echo "update_needed=promotion" >> $GITHUB_OUTPUT
+      id: skip-update-check
+
+    - name: Compare digests and decide if update needed
+      if: steps.promotion-check.outputs.promotion_run == 'false'
+      id: update-check
+      run: |
+        CURRENT="${{ steps.current-digest.outputs.current_digest }}"
+        CACHED="${{ steps.cache-check.outputs.cached_digest }}"
+        
+        if [ "$CURRENT" != "$CACHED" ]; then
+          echo "update_needed=true" >> $GITHUB_OUTPUT
+          echo "New phpMyAdmin image detected!"
+          echo "Current: $CURRENT"
+          echo "Cached: $CACHED"
+        else
+          echo "update_needed=false" >> $GITHUB_OUTPUT
+          echo "No update needed - digests match"
+        fi
+
+    - name: Build Docker image with next tag
+      if: (steps.update-check.outputs.update_needed == 'true') || (steps.skip-update-check.outputs.update_needed == 'promotion')
+      run: |
+        if [ "${{ steps.promotion-check.outputs.promotion_run }}" = "true" ]; then
+          echo "Skipping build - using existing next image for promotion"
+        else
+          echo "Building image with next tag using specific digest..."
+          BASE_IMAGE_WITH_DIGEST="phpmyadmin@${{ steps.current-digest.outputs.current_digest }}"
+          echo "Using base image: $BASE_IMAGE_WITH_DIGEST"
+          docker build --build-arg BASE_IMAGE="$BASE_IMAGE_WITH_DIGEST" -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:next .
+        fi
+
+    - name: Test the next build
+      if: steps.update-check.outputs.update_needed == 'true'
+      run: |
+        echo "Testing the next build..."
+        
+        # Start container in background
+        docker run -d --name phpmyadmin-next-test -p 8080:80 -p 8443:443 ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:next
+        
+        # Wait for container to start
+        sleep 15
+        
+        # Check if container is running
+        docker ps
+        
+        # Test HTTP endpoint (should redirect to HTTPS)
+        echo "Testing HTTP redirect..."
+        HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/ || echo "000")
+        echo "HTTP Status: $HTTP_STATUS"
+        if [[ "$HTTP_STATUS" =~ ^30[1-8]$ ]]; then
+          echo "✓ HTTP correctly redirects to HTTPS"
+        else
+          echo "✗ HTTP did not redirect properly (expected 30x, got $HTTP_STATUS)"
+          docker logs phpmyadmin-next-test
+          exit 1
+        fi
+        
+        # Test HTTPS endpoint (should serve phpMyAdmin)
+        echo "Testing HTTPS endpoint..."
+        HTTPS_RESPONSE=$(curl -s -k https://localhost:8443/ || echo "")
+        HTTPS_STATUS=$(curl -s -k -o /dev/null -w "%{http_code}" https://localhost:8443/ || echo "000")
+        echo "HTTPS Status: $HTTPS_STATUS"
+        echo "Response contains phpMyAdmin: $(echo "$HTTPS_RESPONSE" | grep -i "phpmyadmin" >/dev/null && echo "Yes" || echo "No")"
+        
+        if [[ "$HTTPS_STATUS" == "200" ]] && echo "$HTTPS_RESPONSE" | grep -i "phpmyadmin" >/dev/null; then
+          echo "✓ HTTPS correctly serves phpMyAdmin"
+        else
+          echo "✗ HTTPS did not serve phpMyAdmin properly"
+          echo "Response preview:"
+          echo "$HTTPS_RESPONSE" | head -10
+          docker logs phpmyadmin-next-test
+          exit 1
+        fi
+        
+        # Cleanup test container
+        docker stop phpmyadmin-next-test
+        docker rm phpmyadmin-next-test
+
+    - name: Set up Docker Buildx
+      if: (steps.update-check.outputs.update_needed == 'true') || (steps.skip-update-check.outputs.update_needed == 'promotion')
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log into Docker registry
+      if: (steps.update-check.outputs.update_needed == 'true') || (steps.skip-update-check.outputs.update_needed == 'promotion')
+      run: echo "${{ secrets.dockerhub_token }}" | docker login -u splitice --password-stdin
+
+    - name: Push next image to registry
+      if: steps.update-check.outputs.update_needed == 'true'
+      run: |
+        echo "Pushing next image to registry..."
+        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:next
+
+    - name: Update digest cache and create PR for main merge
+      if: steps.update-check.outputs.update_needed == 'true'
+      run: |
+        # Save the new digest
+        echo "${{ steps.current-digest.outputs.current_digest }}" > .last-phpmyadmin-digest
+        
+        # Configure git
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action Auto-Update"
+        
+        # Commit the digest update
+        git add .last-phpmyadmin-digest
+        git commit -m "Auto-update: phpMyAdmin base image updated to ${{ steps.current-digest.outputs.current_digest }}" || echo "No changes to commit"
+        
+        # Push to current branch
+        git push origin ${{ github.ref_name }}
+        
+        echo "Updated digest cache and pushed changes"
+
+    - name: Create Pull Request for main branch
+      if: steps.update-check.outputs.update_needed == 'true' && github.ref_name != 'main'
+      id: create-pr
+      uses: peter-evans/create-pull-request@v5
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        base: main
+        head: ${{ github.ref_name }}
+        title: "Auto-update: phpMyAdmin base image updated"
+        body: |
+          ## Auto-Update: phpMyAdmin Base Image Updated
+          
+          🤖 This PR was automatically created by the auto-update workflow.
+          
+          ### Changes:
+          - Updated phpMyAdmin base image to digest: `${{ steps.current-digest.outputs.current_digest }}`
+          - Built and tested image with "next" tag
+          - All tests passed successfully ✅
+          
+          ### Testing Results:
+          - ✅ HTTP redirects correctly to HTTPS
+          - ✅ HTTPS serves phpMyAdmin content properly
+          - ✅ Image builds without errors
+          - ✅ Container starts and runs successfully
+          
+          **Ready for merge!** 🚀
+        
+        assignees: splitice
+        draft: false
+
+    - name: Enable auto-merge on PR
+      if: steps.update-check.outputs.update_needed == 'true' && github.ref_name != 'main' && steps.create-pr.outputs.pull-request-number
+      run: |
+        # Enable auto-merge using GitHub CLI
+        gh pr merge ${{ steps.create-pr.outputs.pull-request-number }} --auto --squash
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Auto-merge to main (if on main branch)
+      if: steps.update-check.outputs.update_needed == 'true' && github.ref_name == 'main'
+      run: |
+        echo "Already on main branch - changes committed directly"
+
+    - name: Promote next to latest tag (if on main branch)
+      if: (steps.skip-update-check.outputs.update_needed == 'promotion') || (steps.update-check.outputs.update_needed == 'true' && github.ref_name == 'main')
+      run: |
+        # Pull the next image and tag it as latest
+        docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:next
+        docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:next ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+        
+        echo "Successfully promoted next to latest tag"
+
+    - name: Create release summary
+      if: (steps.update-check.outputs.update_needed == 'true') || (steps.skip-update-check.outputs.update_needed == 'promotion')
+      run: |
+        if [ "${{ steps.promotion-check.outputs.promotion_run }}" = "true" ]; then
+          echo "## Auto-Update Promotion" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **Successfully promoted next → latest**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Action:** Promoted \`next\` tag to \`latest\` tag" >> $GITHUB_STEP_SUMMARY
+          echo "- **Trigger:** Post-merge promotion after successful PR" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "## Auto-Update Summary" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **phpMyAdmin base image updated successfully**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Previous digest:** \`${{ steps.cache-check.outputs.cached_digest }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **New digest:** \`${{ steps.current-digest.outputs.current_digest }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image tagged:** \`next\` and pushed to registry" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tests:** All tests passed ✅" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.ref_name }}" != "main" ]; then
+            echo "- **PR Created:** Ready for auto-merge to main branch" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Branch:** Changes committed directly to main" >> $GITHUB_STEP_SUMMARY
+          fi
+        fi
+
+    - name: No update needed
+      if: steps.update-check.outputs.update_needed == 'false'
+      run: |
+        echo "## Auto-Update Check" >> $GITHUB_STEP_SUMMARY
+        echo "ℹ️ **No update needed**" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "The phpMyAdmin base image is already up to date." >> $GITHUB_STEP_SUMMARY
+        echo "- **Current digest:** \`${{ steps.current-digest.outputs.current_digest }}\`" >> $GITHUB_STEP_SUMMARY

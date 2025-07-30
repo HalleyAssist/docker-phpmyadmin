@@ -1,4 +1,5 @@
-FROM phpmyadmin:latest as base
+ARG BASE_IMAGE=phpmyadmin:latest
+FROM ${BASE_IMAGE} as base
 
 # Install packages needed for TLS/SSL support
 RUN apt-get update && apt-get install -y \
@@ -24,7 +25,7 @@ RUN openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
     -subj "/C=US/ST=State/L=City/O=Organization/CN=localhost"
 
 
-FROM phpmyadmin:latest
+FROM ${BASE_IMAGE}
 
 COPY --from=base / /
 
