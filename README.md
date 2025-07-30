@@ -42,3 +42,12 @@ docker run -d \
 
 ## Environment Variables
 All environment variables from the official phpMyAdmin image are supported. See the [official documentation](https://hub.docker.com/_/phpmyadmin) for details.
+
+## Auto-Update Feature
+This repository includes an automated workflow that:
+- Checks daily for new releases of the base phpMyAdmin image
+- Automatically builds and tests the image with the "next" tag when updates are detected
+- Promotes to "latest" tag and merges to main branch after successful testing
+- Provides summary reports of update activities
+
+The auto-update workflow runs daily at 2:00 AM UTC and can also be triggered manually from the GitHub Actions interface.

@@ -1,0 +1,186 @@
+name: Auto-Update phpMyAdmin Base Image
+
+on:
+  schedule:
+    # Run daily at 2:00 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch: # Allow manual triggering
+
+env:
+  REGISTRY: docker.io
+  IMAGE_NAME: halleyassistau/docker-phpmyadmin
+
+jobs:
+  check-and-update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      pull-requests: write
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        fetch-depth: 0
+
+    - name: Get current phpMyAdmin image digest
+      id: current-digest
+      run: |
+        # Pull the latest image and get its digest
+        docker pull phpmyadmin:latest >/dev/null 2>&1
+        CURRENT_DIGEST=$(docker inspect phpmyadmin:latest | jq -r '.[0].RepoDigests[0]' | cut -d'@' -f2)
+        echo "current_digest=$CURRENT_DIGEST" >> $GITHUB_OUTPUT
+        echo "Current phpMyAdmin digest: $CURRENT_DIGEST"
+
+    - name: Check for cached digest
+      id: cache-check
+      run: |
+        # Check if we have a cached digest file
+        if [ -f .last-phpmyadmin-digest ]; then
+          CACHED_DIGEST=$(cat .last-phpmyadmin-digest)
+          echo "cached_digest=$CACHED_DIGEST" >> $GITHUB_OUTPUT
+          echo "Cached digest: $CACHED_DIGEST"
+        else
+          echo "cached_digest=" >> $GITHUB_OUTPUT
+          echo "No cached digest found"
+        fi
+
+    - name: Compare digests and decide if update needed
+      id: update-check
+      run: |
+        CURRENT="${{ steps.current-digest.outputs.current_digest }}"
+        CACHED="${{ steps.cache-check.outputs.cached_digest }}"
+        
+        if [ "$CURRENT" != "$CACHED" ]; then
+          echo "update_needed=true" >> $GITHUB_OUTPUT
+          echo "New phpMyAdmin image detected!"
+          echo "Current: $CURRENT"
+          echo "Cached: $CACHED"
+        else
+          echo "update_needed=false" >> $GITHUB_OUTPUT
+          echo "No update needed - digests match"
+        fi
+
+    - name: Build Docker image with next tag
+      if: steps.update-check.outputs.update_needed == 'true'
+      run: |
+        echo "Building image with next tag..."
+        docker build -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:next .
+
+    - name: Test the next build
+      if: steps.update-check.outputs.update_needed == 'true'
+      run: |
+        echo "Testing the next build..."
+        
+        # Start container in background
+        docker run -d --name phpmyadmin-next-test -p 8080:80 -p 8443:443 ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:next
+        
+        # Wait for container to start
+        sleep 15
+        
+        # Check if container is running
+        docker ps
+        
+        # Test HTTP endpoint (should redirect to HTTPS)
+        echo "Testing HTTP redirect..."
+        HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/ || echo "000")
+        echo "HTTP Status: $HTTP_STATUS"
+        if [[ "$HTTP_STATUS" =~ ^30[1-8]$ ]]; then
+          echo "✓ HTTP correctly redirects to HTTPS"
+        else
+          echo "✗ HTTP did not redirect properly (expected 30x, got $HTTP_STATUS)"
+          docker logs phpmyadmin-next-test
+          exit 1
+        fi
+        
+        # Test HTTPS endpoint (should serve phpMyAdmin)
+        echo "Testing HTTPS endpoint..."
+        HTTPS_RESPONSE=$(curl -s -k https://localhost:8443/ || echo "")
+        HTTPS_STATUS=$(curl -s -k -o /dev/null -w "%{http_code}" https://localhost:8443/ || echo "000")
+        echo "HTTPS Status: $HTTPS_STATUS"
+        echo "Response contains phpMyAdmin: $(echo "$HTTPS_RESPONSE" | grep -i "phpmyadmin" >/dev/null && echo "Yes" || echo "No")"
+        
+        if [[ "$HTTPS_STATUS" == "200" ]] && echo "$HTTPS_RESPONSE" | grep -i "phpmyadmin" >/dev/null; then
+          echo "✓ HTTPS correctly serves phpMyAdmin"
+        else
+          echo "✗ HTTPS did not serve phpMyAdmin properly"
+          echo "Response preview:"
+          echo "$HTTPS_RESPONSE" | head -10
+          docker logs phpmyadmin-next-test
+          exit 1
+        fi
+        
+        # Cleanup test container
+        docker stop phpmyadmin-next-test
+        docker rm phpmyadmin-next-test
+
+    - name: Set up Docker Buildx
+      if: steps.update-check.outputs.update_needed == 'true'
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log into Docker registry
+      if: steps.update-check.outputs.update_needed == 'true'
+      run: echo "${{ secrets.dockerhub_token }}" | docker login -u splitice --password-stdin
+
+    - name: Push next image to registry
+      if: steps.update-check.outputs.update_needed == 'true'
+      run: |
+        echo "Pushing next image to registry..."
+        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:next
+
+    - name: Update digest cache and merge to main
+      if: steps.update-check.outputs.update_needed == 'true'
+      run: |
+        # Save the new digest
+        echo "${{ steps.current-digest.outputs.current_digest }}" > .last-phpmyadmin-digest
+        
+        # Configure git
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        
+        # Commit the digest update
+        git add .last-phpmyadmin-digest
+        git commit -m "Auto-update: phpMyAdmin base image updated to ${{ steps.current-digest.outputs.current_digest }}"
+        
+        # Push to current branch first
+        git push origin ${{ github.ref_name }}
+        
+        # If we're not on main branch, merge to main
+        if [ "${{ github.ref_name }}" != "main" ]; then
+          git checkout main
+          git pull origin main
+          git merge ${{ github.ref_name }} --no-ff -m "Auto-merge: Updated phpMyAdmin base image"
+          git push origin main
+        fi
+
+    - name: Promote next to latest tag
+      if: steps.update-check.outputs.update_needed == 'true'
+      run: |
+        # Pull the next image and tag it as latest
+        docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:next
+        docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:next ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+        docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+        
+        echo "Successfully promoted next to latest tag"
+
+    - name: Create release summary
+      if: steps.update-check.outputs.update_needed == 'true'
+      run: |
+        echo "## Auto-Update Summary" >> $GITHUB_STEP_SUMMARY
+        echo "✅ **phpMyAdmin base image updated successfully**" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "- **Previous digest:** \`${{ steps.cache-check.outputs.cached_digest }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **New digest:** \`${{ steps.current-digest.outputs.current_digest }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Tags updated:** \`next\` → \`latest\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Tests:** All tests passed ✅" >> $GITHUB_STEP_SUMMARY
+
+    - name: No update needed
+      if: steps.update-check.outputs.update_needed == 'false'
+      run: |
+        echo "## Auto-Update Check" >> $GITHUB_STEP_SUMMARY
+        echo "ℹ️ **No update needed**" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "The phpMyAdmin base image is already up to date." >> $GITHUB_STEP_SUMMARY
+        echo "- **Current digest:** \`${{ steps.current-digest.outputs.current_digest }}\`" >> $GITHUB_STEP_SUMMARY
