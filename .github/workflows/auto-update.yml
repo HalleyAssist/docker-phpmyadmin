@@ -180,13 +180,12 @@ jobs:
     - name: Create Pull Request for main branch
       if: steps.update-check.outputs.update_needed == 'true' && github.ref_name != 'main'
       id: create-pr
-      uses: peter-evans/create-pull-request@v5
+      uses: HalleyAssist/pull-request@master
       with:
-        token: ${{ secrets.GITHUB_TOKEN }}
-        base: main
-        head: ${{ github.ref_name }}
-        title: "Auto-update: phpMyAdmin base image updated"
-        body: |
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        destination_branch: main
+        pr_title: "Auto-update: phpMyAdmin base image updated"
+        pr_body: |
           ## Auto-Update: phpMyAdmin Base Image Updated
           
           🤖 This PR was automatically created by the auto-update workflow.
@@ -203,9 +202,9 @@ jobs:
           - ✅ Container starts and runs successfully
           
           **Ready for merge!** 🚀
-        
-        assignees: splitice
-        draft: false
+        pr_label: "auto-update"                            # Comma-separated list (no spaces)
+        pr_draft: false
+        pr_allow_empty: false                              # Creates pull request even if there are no changes
 
     - name: Enable auto-merge on PR
       if: steps.update-check.outputs.update_needed == 'true' && github.ref_name != 'main' && steps.create-pr.outputs.pull-request-number
