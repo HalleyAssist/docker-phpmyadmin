@@ -1,4 +1,4 @@
-FROM phpmyadmin:latest
+FROM phpmyadmin:latest as base
 
 # Install packages needed for TLS/SSL support
 RUN apt-get update && apt-get install -y \
@@ -14,13 +14,19 @@ COPY apache-ssl.conf /etc/apache2/sites-available/default-ssl.conf
 
 # Enable SSL module and site
 RUN a2enmod ssl && \
+    a2enmod headers && \
     a2ensite default-ssl
 
 # Create self-signed certificate if none provided
 RUN openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-    -keyout /etc/ssl/certs/phpmyadmin/server.key \
-    -out /etc/ssl/certs/phpmyadmin/server.crt \
+    -keyout /etc/ssl/certs/phpmyadmin/tls.key \
+    -out /etc/ssl/certs/phpmyadmin/tls.crt \
     -subj "/C=US/ST=State/L=City/O=Organization/CN=localhost"
+
+
+FROM phpmyadmin:latest
+
+COPY --from=base / /
 
 # Expose both HTTP and HTTPS ports
 EXPOSE 80 443
